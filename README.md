@@ -60,24 +60,35 @@ A feature-rich, modern system monitor with a beautiful terminal UI built using P
 
 ## Installation
 
-1. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-2. Run the monitor:
-```bash
-python sysmon.py
-```
-
-## Quick Install (Debian/Ubuntu)
+### Quick Install from GitHub
 
 ```bash
-# Download and install the .deb package
-wget https://github.com/veroxsity/advsysmon/releases/latest/download/advanced-sysmon.deb
-sudo dpkg -i advanced-sysmon.deb
+# Clone the repository
+git clone https://github.com/veroxsity/advsysmon.git
+cd advsysmon
+
+# Install dependencies
+pip3 install -r requirements.txt
 
 # Run the application
+python3 src/advsysmon.py
+```
+
+### Alternative: Direct Download
+
+```bash
+# Download just the main script
+curl -O https://raw.githubusercontent.com/veroxsity/advsysmon/main/src/advsysmon.py
+
+# Install dependencies manually
+pip3 install psutil rich colorama tabulate blessed click
+
+# Optional GPU monitoring dependencies
+pip3 install pynvml GPUtil
+
+# Run the application
+python3 advsysmon.py
+```
 advanced-sysmon
 ```
 
@@ -97,7 +108,7 @@ advanced-sysmon
 Simply run the script and enjoy the real-time system monitoring:
 
 ```bash
-python sysmon.py
+python3 src/advsysmon.py
 ```
 
 Press `Ctrl+C` to exit gracefully.

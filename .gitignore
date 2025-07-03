@@ -175,3 +175,105 @@ test_*.py
 .local/
 temp/
 tmp/
+
+# Only include essential files for users
+# Exclude all development infrastructure
+
+# Development directories
+scripts/
+docs/
+.github/
+
+# Development files
+setup.py
+MANIFEST.in
+pyproject.toml
+
+# All documentation except main README
+SETUP_GUIDE.md
+DISTRIBUTION.md
+GITHUB_SETUP.md
+PACKAGE_SUMMARY.md
+READY_TO_DEPLOY.md
+RELEASE_NOTES.md
+LOCAL_*.md
+DRAFT_*.md
+
+# All shell scripts
+*.sh
+
+# Build artifacts
+*.deb
+*.rpm
+*.tar.gz
+*.whl
+*.egg-info/
+build/
+dist/
+
+# Private/sensitive files
+*.private.*
+*-private.*
+local-*
+push-*
+deploy-*
+
+# Setup and configuration files
+.env*
+config*
+
+# Personal notes
+NOTES*
+TODO*
+personal/
+
+# IDE and editor specific files
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+.directory
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Log files
+*.log
+logs/
+
+# Cache directories
+.cache/
+cache/
+
+# Temporary build artifacts
+build-temp/
+release-temp/
+
+# Private keys and certificates
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Configuration files with secrets
+config.local.*
+secrets.*
