@@ -179,10 +179,11 @@ tmp/
 # Only include essential files for users
 # Exclude all development infrastructure
 
-# Development directories
+# Development infrastructure (keep local only)
 scripts/
 docs/
 .github/
+packaging/
 
 # Development files
 setup.py
@@ -202,14 +203,16 @@ DRAFT_*.md
 # All shell scripts
 *.sh
 
-# Build artifacts
+# Build artifacts and releases
 *.deb
 *.rpm
 *.tar.gz
+*.zip
 *.whl
 *.egg-info/
 build/
 dist/
+releases/
 
 # Private/sensitive files
 *.private.*
