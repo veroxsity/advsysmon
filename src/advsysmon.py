@@ -12,10 +12,13 @@ import sys
 import time
 import platform
 import socket
+import json
+import subprocess
 from datetime import datetime, timedelta
 from collections import deque
 import threading
 import signal
+from pathlib import Path
 
 import psutil
 from rich.console import Console
@@ -28,6 +31,8 @@ from rich.text import Text
 from rich.columns import Columns
 from rich import box
 from rich.align import Align
+from rich.status import Status
+from rich.tree import Tree
 
 try:
     import GPUtil
@@ -35,26 +40,126 @@ try:
 except ImportError:
     GPU_AVAILABLE = False
 
+try:
+    import docker
+    DOCKER_AVAILABLE = True
+except ImportError:
+    DOCKER_AVAILABLE = False
+
 class SystemMonitor:
     def __init__(self):
         self.console = Console()
         self.running = True
         self.update_interval = 1.0
         
-        # Historical data for graphs
-        self.cpu_history = deque(maxlen=50)
-        self.memory_history = deque(maxlen=50)
-        self.network_history = deque(maxlen=50)
+        # Configuration
+        self.config_file = Path.home() / ".config" / "advsysmon" / "config.json"
+        self.config = self._load_config()
         
-        # Previous network counters for speed calculation
-        self.prev_net_counters = self._get_net_counters()
-        
-        # Process monitoring
-        self.process_sort_key = 'cpu_percent'
+        # UI State
+        self.current_view = "main"  # main, processes, docker, network, logs
+        self.process_sort_key = self.config.get('process_sort_key', 'cpu_percent')
         self.show_processes = True
+        self.selected_process_index = 0
+        self.show_help = False
+        
+        # Monitoring toggles
+        self.show_system_info = self.config.get('show_system_info', True)
+        self.show_cpu = self.config.get('show_cpu', True)
+        self.show_memory = self.config.get('show_memory', True)
+        self.show_disk = self.config.get('show_disk', True)
+        self.show_network = self.config.get('show_network', True)
+        self.show_gpu = self.config.get('show_gpu', True)
+        self.show_battery = self.config.get('show_battery', True)
+        
+        # Historical data for graphs
+        self.cpu_history = deque(maxlen=100)
+        self.memory_history = deque(maxlen=100)
+        self.network_history = deque(maxlen=100)
+        self.disk_io_history = deque(maxlen=100)
+        
+        # Previous counters for delta calculations
+        self.prev_net_counters = self._get_net_counters()
+        self.prev_disk_counters = self._get_disk_io_counters()
         
         # System info cache
         self.system_info = self._get_system_info()
+        
+        # Alerts and thresholds
+        self.alerts = []
+        self.thresholds = self.config.get('thresholds', {
+            'cpu_warning': 80,
+            'cpu_critical': 95,
+            'memory_warning': 80,
+            'memory_critical': 95,
+            'disk_warning': 85,
+            'disk_critical': 95,
+            'temperature_warning': 75,
+            'temperature_critical': 85
+        })
+        
+        # Docker monitoring
+        self.docker_client = None
+        if DOCKER_AVAILABLE:
+            try:
+                self.docker_client = docker.from_env()
+            except:
+                pass
+    
+    def _load_config(self):
+        """Load configuration from file"""
+        try:
+            if self.config_file.exists():
+                with open(self.config_file, 'r') as f:
+                    return json.load(f)
+        except:
+            pass
+        return self._default_config()
+    
+    def _default_config(self):
+        """Default configuration"""
+        return {
+            'update_interval': 1.0,
+            'process_sort_key': 'cpu_percent',
+            'show_system_info': True,
+            'show_cpu': True,
+            'show_memory': True,
+            'show_disk': True,
+            'show_network': True,
+            'show_gpu': True,
+            'show_battery': True,
+            'thresholds': {
+                'cpu_warning': 80,
+                'cpu_critical': 95,
+                'memory_warning': 80,
+                'memory_critical': 95,
+                'disk_warning': 85,
+                'disk_critical': 95,
+                'temperature_warning': 75,
+                'temperature_critical': 85
+            }
+        }
+    
+    def _save_config(self):
+        """Save configuration to file"""
+        try:
+            self.config_file.parent.mkdir(parents=True, exist_ok=True)
+            config = {
+                'update_interval': self.update_interval,
+                'process_sort_key': self.process_sort_key,
+                'show_system_info': self.show_system_info,
+                'show_cpu': self.show_cpu,
+                'show_memory': self.show_memory,
+                'show_disk': self.show_disk,
+                'show_network': self.show_network,
+                'show_gpu': self.show_gpu,
+                'show_battery': self.show_battery,
+                'thresholds': self.thresholds
+            }
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+        except:
+            pass
         
     def _get_system_info(self):
         """Get static system information"""
@@ -75,6 +180,14 @@ class SystemMonitor:
         try:
             counters = psutil.net_io_counters()
             return counters.bytes_sent, counters.bytes_recv
+        except:
+            return 0, 0
+    
+    def _get_disk_io_counters(self):
+        """Get current disk I/O counters"""
+        try:
+            counters = psutil.disk_io_counters()
+            return counters.read_bytes, counters.write_bytes
         except:
             return 0, 0
     
@@ -297,6 +410,255 @@ class SystemMonitor:
             
         return sparkline
     
+    def _check_alerts(self):
+        """Check system metrics against thresholds and generate alerts"""
+        current_time = datetime.now()
+        
+        # CPU alert
+        cpu_usage = psutil.cpu_percent(interval=None)
+        if cpu_usage > self.thresholds['cpu_critical']:
+            self.alerts.append({
+                'time': current_time,
+                'level': 'critical',
+                'message': f'Critical CPU usage: {cpu_usage:.1f}%',
+                'metric': 'cpu'
+            })
+        elif cpu_usage > self.thresholds['cpu_warning']:
+            self.alerts.append({
+                'time': current_time,
+                'level': 'warning',
+                'message': f'High CPU usage: {cpu_usage:.1f}%',
+                'metric': 'cpu'
+            })
+        
+        # Memory alert
+        memory = psutil.virtual_memory()
+        if memory.percent > self.thresholds['memory_critical']:
+            self.alerts.append({
+                'time': current_time,
+                'level': 'critical',
+                'message': f'Critical memory usage: {memory.percent:.1f}%',
+                'metric': 'memory'
+            })
+        elif memory.percent > self.thresholds['memory_warning']:
+            self.alerts.append({
+                'time': current_time,
+                'level': 'warning',
+                'message': f'High memory usage: {memory.percent:.1f}%',
+                'metric': 'memory'
+            })
+        
+        # Keep only last 10 alerts
+        self.alerts = self.alerts[-10:]
+    
+    def _get_docker_info(self):
+        """Get Docker container information"""
+        if not self.docker_client:
+            return None
+        
+        try:
+            containers = self.docker_client.containers.list(all=True)
+            container_info = []
+            
+            for container in containers:
+                stats = None
+                if container.status == 'running':
+                    try:
+                        stats = container.stats(stream=False)
+                    except:
+                        pass
+                
+                container_info.append({
+                    'name': container.name,
+                    'image': container.image.tags[0] if container.image.tags else 'unknown',
+                    'status': container.status,
+                    'ports': container.ports,
+                    'stats': stats
+                })
+            
+            return container_info
+        except:
+            return None
+    
+    def _get_system_services(self):
+        """Get system services status"""
+        services = []
+        try:
+            # Get systemd services
+            result = subprocess.run(['systemctl', 'list-units', '--type=service', '--state=running', '--no-pager', '--no-legend'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    if line.strip():
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            services.append({
+                                'name': parts[0].replace('.service', ''),
+                                'status': parts[2],
+                                'description': ' '.join(parts[4:])
+                            })
+        except:
+            pass
+        
+        return services[:20]  # Limit to 20 services
+    
+    def _get_network_connections(self):
+        """Get active network connections"""
+        try:
+            connections = psutil.net_connections(kind='inet')
+            connection_summary = {
+                'established': 0,
+                'listen': 0,
+                'time_wait': 0,
+                'close_wait': 0,
+                'syn_sent': 0,
+                'syn_recv': 0
+            }
+            
+            for conn in connections:
+                status = conn.status.lower() if conn.status else 'unknown'
+                if status in connection_summary:
+                    connection_summary[status] += 1
+                    
+            return connection_summary
+        except:
+            return {}
+    
+    def create_layout(self):
+        """Create the main layout"""
+        # Check for alerts
+        self._check_alerts()
+        
+        layout = Layout()
+        
+        # Split into header and body
+        layout.split(
+            Layout(name="header", size=3),
+            Layout(name="body")
+        )
+        
+        # Header with title, timestamp, and view indicator
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        alert_indicator = ""
+        if self.alerts:
+            recent_critical = any(a['level'] == 'critical' for a in self.alerts[-3:])
+            alert_indicator = " 🔴 CRITICAL ALERTS" if recent_critical else " ⚠️ ALERTS"
+        
+        header_text = Text.assemble(
+            ("🖥️  Advanced System Monitor", "bold blue"),
+            (alert_indicator, "bold red" if "CRITICAL" in alert_indicator else "bold yellow"),
+            " | ",
+            (f"Updated: {timestamp}", "dim"),
+            " | ",
+            (f"View: {self.current_view.upper()}", "bold green")
+        )
+        layout["header"].update(Panel(Align.center(header_text), border_style="bright_blue"))
+        
+        if self.current_view == "main":
+            # Main dashboard view
+            layout["body"].split_row(
+                Layout(name="left", ratio=2),
+                Layout(name="right", ratio=1)
+            )
+            
+            # Split left column into rows
+            layout["left"].split_column(
+                Layout(name="system_cpu", ratio=1),
+                Layout(name="memory_disk", ratio=1),
+                Layout(name="network_battery", ratio=1)
+            )
+            
+            # Split system_cpu row
+            if self.show_system_info and self.show_cpu:
+                layout["system_cpu"].split_row(
+                    Layout(self._create_system_info_panel()),
+                    Layout(self._create_cpu_panel())
+                )
+            elif self.show_system_info:
+                layout["system_cpu"].update(self._create_system_info_panel())
+            elif self.show_cpu:
+                layout["system_cpu"].update(self._create_cpu_panel())
+            
+            # Split memory_disk row
+            if self.show_memory and self.show_disk:
+                layout["memory_disk"].split_row(
+                    Layout(self._create_memory_panel()),
+                    Layout(self._create_disk_panel())
+                )
+            elif self.show_memory:
+                layout["memory_disk"].update(self._create_memory_panel())
+            elif self.show_disk:
+                layout["memory_disk"].update(self._create_disk_panel())
+            
+            # Split network_battery row
+            network_battery_panels = []
+            if self.show_network:
+                network_battery_panels.append(self._create_network_panel())
+            
+            # Add battery panel if available and enabled
+            if self.show_battery:
+                battery_panel = self._create_battery_panel()
+                if "No battery detected" not in str(battery_panel):
+                    network_battery_panels.append(battery_panel)
+            
+            # Add GPU panel if available and enabled
+            if self.show_gpu:
+                gpu_panel = self._create_gpu_panel()
+                if "No GPU detected" not in str(gpu_panel):
+                    network_battery_panels.append(gpu_panel)
+            
+            if len(network_battery_panels) == 1:
+                layout["network_battery"].update(network_battery_panels[0])
+            elif len(network_battery_panels) == 2:
+                layout["network_battery"].split_row(*network_battery_panels)
+            elif len(network_battery_panels) >= 3:
+                layout["network_battery"].split_column(*network_battery_panels[:3])
+            
+            # Right column for processes or alerts
+            if self.alerts and len(self.alerts) > 3:
+                layout["right"].split_column(
+                    Layout(self._create_alerts_panel(), ratio=1),
+                    Layout(self._create_processes_panel(), ratio=2)
+                )
+            else:
+                layout["right"].update(self._create_processes_panel())
+        
+        elif self.current_view == "docker":
+            # Docker view
+            layout["body"].split_column(
+                Layout(self._create_docker_panel(), ratio=2),
+                Layout(self._create_services_panel(), ratio=1)
+            )
+        
+        elif self.current_view == "alerts":
+            # Alerts view
+            layout["body"].split_column(
+                Layout(self._create_alerts_panel(), ratio=1),
+                Layout(self._create_system_info_panel(), ratio=1)
+            )
+        
+        return layout
+    
+    def signal_handler(self, signum, frame):
+        """Handle interrupt signals gracefully"""
+        self.running = False
+        self.console.print("\n[yellow]Shutting down system monitor...[/yellow]")
+        sys.exit(0)
+    
+    def run(self):
+        """Main run loop"""
+        # Set up signal handlers
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        
+        try:
+            with Live(self.create_layout(), refresh_per_second=1, screen=True) as live:
+                while self.running:
+                    time.sleep(self.update_interval)
+                    live.update(self.create_layout())
+        except KeyboardInterrupt:
+            self.signal_handler(None, None)
+
     def _create_system_info_panel(self):
         """Create system information panel"""
         info = self.system_info
@@ -314,10 +676,16 @@ class SystemMonitor:
         table.add_row("Uptime", str(uptime).split('.')[0])
         table.add_row("Boot Time", info['boot_time'].strftime("%Y-%m-%d %H:%M:%S"))
         
+        # Add alerts indicator
+        if self.alerts:
+            recent_alerts = len([a for a in self.alerts if (datetime.now() - a['time']).seconds < 300])
+            alert_color = "red" if any(a['level'] == 'critical' for a in self.alerts[-3:]) else "yellow"
+            table.add_row("⚠️ Alerts", f"{recent_alerts} recent", Text("", style=alert_color))
+        
         return Panel(table, title="System Information", border_style="blue")
     
     def _create_cpu_panel(self):
-        """Create CPU information panel"""
+        """Create CPU information panel with enhanced monitoring"""
         cpu_info = self._get_cpu_info()
         
         table = Table(show_header=False, box=None, padding=(0, 1))
@@ -325,12 +693,35 @@ class SystemMonitor:
         table.add_column("Value")
         table.add_column("Visual")
         
-        # Overall CPU usage
+        # Overall CPU usage with alert coloring
+        cpu_color = "green"
+        if cpu_info['usage'] > self.thresholds['cpu_critical']:
+            cpu_color = "red"
+        elif cpu_info['usage'] > self.thresholds['cpu_warning']:
+            cpu_color = "yellow"
+        
         table.add_row(
             "CPU Usage",
             f"{cpu_info['usage']:.1f}%",
             self._create_progress_bar(cpu_info['usage'])
         )
+        
+        # Per-core usage (show first 8 cores)
+        if 'per_core' in cpu_info and len(cpu_info['per_core']) > 1:
+            cores_to_show = min(8, len(cpu_info['per_core']))
+            core_usage_text = []
+            for i in range(cores_to_show):
+                core_usage = cpu_info['per_core'][i]
+                core_usage_text.append(f"C{i}: {core_usage:.0f}%")
+            
+            # Split cores into two columns
+            for i in range(0, len(core_usage_text), 2):
+                left_core = core_usage_text[i]
+                right_core = core_usage_text[i+1] if i+1 < len(core_usage_text) else ""
+                if i == 0:
+                    table.add_row("Per Core", left_core, right_core)
+                else:
+                    table.add_row("", left_core, right_core)
         
         # CPU cores
         table.add_row(
@@ -347,13 +738,19 @@ class SystemMonitor:
                 f"Max: {self._format_frequency(cpu_info['max_freq'])}"
             )
         
-        # Temperature
+        # Temperature with enhanced monitoring
         if 'temperature' in cpu_info:
-            temp_color = "green" if cpu_info['temperature'] < 70 else "yellow" if cpu_info['temperature'] < 85 else "red"
+            temp = cpu_info['temperature']
+            temp_icon = "🟢"
+            if temp > self.thresholds['temperature_critical']:
+                temp_icon = "🔴"
+            elif temp > self.thresholds['temperature_warning']:
+                temp_icon = "🟡"
+            
             table.add_row(
                 "Temperature",
-                f"{cpu_info['temperature']:.1f}°C",
-                Text("", style=temp_color)
+                f"{temp:.1f}°C {temp_icon}",
+                ""
             )
         
         # Load average
@@ -369,7 +766,7 @@ class SystemMonitor:
         self.cpu_history.append(cpu_info['usage'])
         table.add_row(
             "History",
-            self._create_sparkline(list(self.cpu_history)),
+            self._create_sparkline(list(self.cpu_history), width=30),
             ""
         )
         
@@ -386,7 +783,13 @@ class SystemMonitor:
         table.add_column("Usage")
         table.add_column("Visual")
         
-        # Virtual memory
+        # Virtual memory with alert coloring
+        memory_color = "green"
+        if virtual.percent > self.thresholds['memory_critical']:
+            memory_color = "red"
+        elif virtual.percent > self.thresholds['memory_warning']:
+            memory_color = "yellow"
+        
         table.add_row(
             "RAM",
             f"{self._format_bytes(virtual.used)} / {self._format_bytes(virtual.total)}",
@@ -412,14 +815,14 @@ class SystemMonitor:
         self.memory_history.append(virtual.percent)
         table.add_row(
             "History",
-            self._create_sparkline(list(self.memory_history)),
+            self._create_sparkline(list(self.memory_history), width=30),
             ""
         )
         
         return Panel(table, title="Memory Information", border_style="green")
     
     def _create_disk_panel(self):
-        """Create disk information panel"""
+        """Create disk information panel with I/O monitoring"""
         disks = self._get_disk_info()
         
         table = Table(show_header=True, box=box.ROUNDED)
@@ -431,21 +834,45 @@ class SystemMonitor:
         table.add_column("Usage")
         
         for disk in disks[:5]:  # Show top 5 disks
+            # Color code based on usage
+            usage_color = "green"
+            if disk['percent'] > self.thresholds['disk_critical']:
+                usage_color = "red"
+            elif disk['percent'] > self.thresholds['disk_warning']:
+                usage_color = "yellow"
+            
             usage_bar = self._create_progress_bar(disk['percent'], width=15)
             table.add_row(
-                disk['device'],
-                disk['mountpoint'],
+                disk['device'][:10],  # Truncate long device names
+                disk['mountpoint'][:15],  # Truncate long mount points
                 disk['fstype'],
                 self._format_bytes(disk['used']),
                 self._format_bytes(disk['total']),
                 usage_bar
             )
         
-        return Panel(table, title="Disk Usage", border_style="yellow")
+        # Add disk I/O information
+        current_io = self._get_disk_io_counters()
+        if current_io != (0, 0) and self.prev_disk_counters != (0, 0):
+            read_speed = (current_io[0] - self.prev_disk_counters[0]) / self.update_interval
+            write_speed = (current_io[1] - self.prev_disk_counters[1]) / self.update_interval
+            
+            if read_speed > 0 or write_speed > 0:
+                table.add_row(
+                    "I/O Speed",
+                    f"R: {self._format_bytes(read_speed)}/s",
+                    f"W: {self._format_bytes(write_speed)}/s",
+                    "", "", ""
+                )
+        
+        self.prev_disk_counters = current_io
+        
+        return Panel(table, title="Disk Usage & I/O", border_style="yellow")
     
     def _create_network_panel(self):
-        """Create network information panel"""
+        """Create network information panel with enhanced monitoring"""
         net_info = self._get_network_info()
+        connections = self._get_network_connections()
         
         table = Table(show_header=False, box=None, padding=(0, 1))
         table.add_column("Metric", style="cyan")
@@ -484,12 +911,20 @@ class SystemMonitor:
             ""
         )
         
+        # Connection summary
+        if connections:
+            table.add_row(
+                "Connections",
+                f"Est: {connections.get('established', 0)}",
+                f"Listen: {connections.get('listen', 0)}"
+            )
+        
         # Network history
         total_speed = net_info['download_speed'] + net_info['upload_speed']
         self.network_history.append(total_speed / 1024)  # Convert to KB/s
         table.add_row(
             "Activity",
-            self._create_sparkline(list(self.network_history)),
+            self._create_sparkline(list(self.network_history), width=30),
             ""
         )
         
@@ -514,7 +949,7 @@ class SystemMonitor:
         
         for gpu in gpu_info:
             table.add_row(
-                gpu['name'],
+                gpu['name'][:20],  # Truncate long GPU names
                 self._create_progress_bar(gpu['load'], width=10),
                 f"{gpu['memory_used']}MB / {gpu['memory_total']}MB",
                 f"{gpu['temperature']}°C"
@@ -541,6 +976,13 @@ class SystemMonitor:
         status = "🔌 Charging" if battery_info['plugged'] else "🔋 Discharging"
         table.add_row("Status", status, "")
         
+        # Battery level with color coding
+        battery_color = "green"
+        if battery_info['percent'] < 20:
+            battery_color = "red"
+        elif battery_info['percent'] < 50:
+            battery_color = "yellow"
+        
         table.add_row(
             "Charge",
             f"{battery_info['percent']:.1f}%",
@@ -554,17 +996,17 @@ class SystemMonitor:
         return Panel(table, title="Battery", border_style="cyan")
     
     def _create_processes_panel(self):
-        """Create top processes panel"""
-        processes = self._get_top_processes()
+        """Create top processes panel with enhanced information"""
+        processes = self._get_top_processes(limit=15)
         
         table = Table(show_header=True, box=box.ROUNDED)
-        table.add_column("PID", justify="right")
+        table.add_column("PID", justify="right", style="dim")
         table.add_column("Name", style="cyan")
         table.add_column("CPU%", justify="right")
-        table.add_column("Memory%", justify="right")
+        table.add_column("Mem%", justify="right")
         table.add_column("Memory", justify="right")
         
-        for proc in processes:
+        for i, proc in enumerate(processes):
             memory_info = proc.get('memory_info')
             memory_mb = 0
             if memory_info and hasattr(memory_info, 'rss'):
@@ -572,116 +1014,153 @@ class SystemMonitor:
             elif isinstance(memory_info, dict) and 'rss' in memory_info:
                 memory_mb = memory_info['rss'] / (1024 * 1024)
             
+            # Highlight high resource usage
+            cpu_style = "red" if proc['cpu_percent'] > 50 else "yellow" if proc['cpu_percent'] > 25 else "white"
+            mem_style = "red" if proc['memory_percent'] > 10 else "yellow" if proc['memory_percent'] > 5 else "white"
+            
             table.add_row(
                 str(proc['pid']),
                 proc['name'][:20],
-                f"{proc['cpu_percent']:.1f}",
-                f"{proc['memory_percent']:.1f}",
+                Text(f"{proc['cpu_percent']:.1f}", style=cpu_style),
+                Text(f"{proc['memory_percent']:.1f}", style=mem_style),
                 f"{memory_mb:.0f}MB"
             )
         
-        return Panel(table, title="Top Processes (by CPU)", border_style="white")
+        # Add sort indicator
+        sort_indicator = f"Sorted by: {self.process_sort_key.replace('_', ' ').title()}"
+        
+        return Panel(table, title=f"Top Processes - {sort_indicator}", border_style="white")
     
-    def create_layout(self):
-        """Create the main layout"""
-        layout = Layout()
+    def _create_docker_panel(self):
+        """Create Docker containers panel"""
+        docker_info = self._get_docker_info()
         
-        # Split into header and body
-        layout.split(
-            Layout(name="header", size=3),
-            Layout(name="body")
-        )
+        if not docker_info:
+            return Panel(
+                Align.center("Docker not available or no containers"),
+                title="Docker Containers",
+                border_style="dim"
+            )
         
-        # Header with title and timestamp
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        header_text = Text.assemble(
-            ("🖥️  Advanced System Monitor", "bold blue"),
-            " | ",
-            (f"Updated: {timestamp}", "dim")
-        )
-        layout["header"].update(Panel(Align.center(header_text), border_style="bright_blue"))
+        table = Table(show_header=True, box=box.ROUNDED)
+        table.add_column("Container", style="cyan")
+        table.add_column("Image")
+        table.add_column("Status")
+        table.add_column("Ports")
         
-        # Split body into left and right columns
-        layout["body"].split_row(
-            Layout(name="left", ratio=2),
-            Layout(name="right", ratio=1)
-        )
+        for container in docker_info[:10]:  # Show up to 10 containers
+            status_color = "green" if container['status'] == 'running' else "red"
+            ports_str = ", ".join([f"{k}:{v}" for k, v in container['ports'].items()]) if container['ports'] else "None"
+            
+            table.add_row(
+                container['name'][:15],
+                container['image'][:25],
+                Text(container['status'], style=status_color),
+                ports_str[:20]
+            )
         
-        # Split left column into rows
-        layout["left"].split_column(
-            Layout(name="system_cpu", ratio=1),
-            Layout(name="memory_disk", ratio=1),
-            Layout(name="network_battery", ratio=1)
-        )
-        
-        # Split system_cpu row
-        layout["system_cpu"].split_row(
-            Layout(self._create_system_info_panel()),
-            Layout(self._create_cpu_panel())
-        )
-        
-        # Split memory_disk row
-        layout["memory_disk"].split_row(
-            Layout(self._create_memory_panel()),
-            Layout(self._create_disk_panel())
-        )
-        
-        # Split network_battery row
-        network_battery_panels = [self._create_network_panel()]
-        
-        # Add battery panel if available
-        battery_panel = self._create_battery_panel()
-        if "No battery detected" not in str(battery_panel):
-            network_battery_panels.append(battery_panel)
-        
-        # Add GPU panel if available
-        gpu_panel = self._create_gpu_panel()
-        if "No GPU detected" not in str(gpu_panel):
-            network_battery_panels.append(gpu_panel)
-        
-        if len(network_battery_panels) == 1:
-            layout["network_battery"].update(network_battery_panels[0])
-        elif len(network_battery_panels) == 2:
-            layout["network_battery"].split_row(*network_battery_panels)
-        else:
-            layout["network_battery"].split_column(*network_battery_panels)
-        
-        # Right column for processes
-        layout["right"].update(self._create_processes_panel())
-        
-        return layout
+        return Panel(table, title="Docker Containers", border_style="blue")
     
-    def signal_handler(self, signum, frame):
-        """Handle interrupt signals gracefully"""
-        self.running = False
-        self.console.print("\n[yellow]Shutting down system monitor...[/yellow]")
-        sys.exit(0)
-    
-    def run(self):
-        """Main run loop"""
-        # Set up signal handlers
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
+    def _create_services_panel(self):
+        """Create system services panel"""
+        services = self._get_system_services()
         
-        try:
-            with Live(self.create_layout(), refresh_per_second=1, screen=True) as live:
-                while self.running:
-                    time.sleep(self.update_interval)
-                    live.update(self.create_layout())
-        except KeyboardInterrupt:
-            self.signal_handler(None, None)
+        if not services:
+            return Panel(
+                Align.center("No services information available"),
+                title="System Services",
+                border_style="dim"
+            )
+        
+        table = Table(show_header=True, box=box.ROUNDED)
+        table.add_column("Service", style="cyan")
+        table.add_column("Status")
+        table.add_column("Description")
+        
+        for service in services[:15]:  # Show up to 15 services
+            status_color = "green" if service['status'] == 'active' else "yellow"
+            
+            table.add_row(
+                service['name'][:20],
+                Text(service['status'], style=status_color),
+                service['description'][:40]
+            )
+        
+        return Panel(table, title="System Services", border_style="green")
+    
+    def _create_alerts_panel(self):
+        """Create alerts panel"""
+        if not self.alerts:
+            return Panel(
+                Align.center("No recent alerts"),
+                title="System Alerts",
+                border_style="green"
+            )
+        
+        table = Table(show_header=True, box=box.ROUNDED)
+        table.add_column("Time", style="dim")
+        table.add_column("Level")
+        table.add_column("Message", style="cyan")
+        
+        for alert in self.alerts[-10:]:  # Show last 10 alerts
+            level_color = "red" if alert['level'] == 'critical' else "yellow"
+            time_str = alert['time'].strftime("%H:%M:%S")
+            
+            table.add_row(
+                time_str,
+                Text(alert['level'].upper(), style=level_color),
+                alert['message'][:50]
+            )
+        
+        border_color = "red" if any(a['level'] == 'critical' for a in self.alerts[-3:]) else "yellow"
+        return Panel(table, title="System Alerts", border_style=border_color)
+    
+    def _create_help_panel(self):
+        """Create help panel with keyboard shortcuts"""
+        help_text = """
+[bold cyan]Keyboard Shortcuts:[/bold cyan]
+
+[yellow]q[/yellow] - Quit application
+[yellow]h[/yellow] - Toggle this help
+[yellow]1[/yellow] - Main dashboard view
+[yellow]2[/yellow] - Docker containers view  
+[yellow]3[/yellow] - System alerts view
+
+[yellow]c[/yellow] - Sort processes by CPU
+[yellow]m[/yellow] - Sort processes by Memory
+[yellow]p[/yellow] - Sort processes by PID
+[yellow]n[/yellow] - Sort processes by Name
+
+[yellow]s[/yellow] - Toggle system info panel
+[yellow]u[/yellow] - Toggle CPU panel
+[yellow]r[/yellow] - Toggle memory panel
+[yellow]d[/yellow] - Toggle disk panel
+[yellow]t[/yellow] - Toggle network panel
+[yellow]g[/yellow] - Toggle GPU panel
+[yellow]b[/yellow] - Toggle battery panel
+
+[yellow]+[/yellow] - Increase update interval
+[yellow]-[/yellow] - Decrease update interval
+
+[bold green]Current Configuration:[/bold green]
+Update Interval: {self.update_interval:.1f}s
+Process Sort: {self.process_sort_key.replace('_', ' ').title()}
+        """
+        
+        return Panel(
+            Align.center(help_text),
+            title="Help & Controls",
+            border_style="cyan"
+        )
 
 def main():
     """Main entry point"""
-    monitor = SystemMonitor()
-    
-    # Check if running in a terminal
-    if not os.isatty(sys.stdout.fileno()):
-        print("This application requires a terminal to run properly.")
-        sys.exit(1)
-    
     try:
+        monitor = SystemMonitor()
         monitor.run()
+    except KeyboardInterrupt:
+        print("\nExiting system monitor...")
+        sys.exit(0)
     except Exception as e:
         print(f"Error starting system monitor: {e}")
         sys.exit(1)

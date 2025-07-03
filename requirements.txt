@@ -6,3 +6,4 @@ blessed>=1.19.1
 click>=8.1.0
 pynvml>=11.5.0
 GPUtil>=1.4.0
+docker>=6.0.0
